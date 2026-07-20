@@ -4,6 +4,7 @@ import type { MarketProvider, ProviderCallbacks } from "../market-data/provider"
 import { normalizeKalshiMarket } from "../market-data/providers/kalshi";
 import { normalizePolymarketMarket } from "../market-data/providers/polymarket";
 import type { MarketRecord } from "../market-data/types";
+import { marketRowCapacity } from "../tui/app";
 
 const baseMarket: MarketRecord = {
   key: "kalshi:TEST",
@@ -85,4 +86,10 @@ test("the hub snapshots and broadcasts provider rows without merging", async () 
 
   unsubscribe();
   hub.stop();
+});
+
+test("the market rail uses all rows that fit the viewport", () => {
+  expect(marketRowCapacity(72, 20)).toBe(20);
+  expect(marketRowCapacity(40, 20)).toBe(13);
+  expect(marketRowCapacity(40, 5)).toBe(5);
 });

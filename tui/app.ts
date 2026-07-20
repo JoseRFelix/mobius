@@ -28,7 +28,7 @@ const palette = {
   background: "#050907",
 };
 
-const visibleRowCount = 12;
+const maxMarketRows = 40;
 
 export type DashboardOptions = Pick<
   CliRendererConfig,
@@ -55,8 +55,22 @@ function sourceLabel(market: MarketRecord): string {
   return market.source === "polymarket" ? "POLY" : "KALSHI";
 }
 
+function sourceMark(market: MarketRecord): string {
+  return market.source === "polymarket" ? "◈" : "K";
+}
+
+function sourceColor(market: MarketRecord): string {
+  return market.source === "polymarket" ? "#6f8cff" : palette.green;
+}
+
 function volumeLabel(market: MarketRecord): string {
   return market.source === "polymarket" ? compactNumber(market.volume) : sizeNumber(market.volume);
+}
+
+export function marketRowCapacity(viewportHeight: number, marketCount: number): number {
+  const availableHeight = Math.max(2, viewportHeight - 14);
+  const rowsThatFit = Math.max(1, Math.floor(availableHeight / 2));
+  return Math.min(maxMarketRows, Math.max(1, marketCount), rowsThatFit);
 }
 
 function buildBook(market: MarketRecord): string {
@@ -104,7 +118,11 @@ function buildTrades(market: MarketRecord): string {
 class MarketDashboard {
   private readonly renderer: CliRenderer;
   private readonly hub: MarketDataHub;
-  private readonly marketRows: TextRenderable[] = [];
+  private readonly marketRows: Array<{
+    container: BoxRenderable;
+    mark: TextRenderable;
+    details: TextRenderable;
+  }> = [];
   private readonly marketPanel: BoxRenderable;
   private readonly lowerPanel: BoxRenderable;
   private readonly chartText: TextRenderable;
@@ -189,25 +207,46 @@ class MarketDashboard {
         id: "market-header",
         width: "100%",
         height: 2,
-        content: "PROVIDER  CONTRACT                         \n──────────────────────────────────────",
+        content: "SRC   CONTRACT                            \n──────────────────────────────────────",
         fg: palette.muted,
         selectable: false,
       }),
     );
 
-    for (let index = 0; index < visibleRowCount; index += 1) {
-      const row = new TextRenderable(renderer, {
+    for (let index = 0; index < maxMarketRows; index += 1) {
+      const container = new BoxRenderable(renderer, {
         id: `market-${index}`,
         width: "100%",
         height: 2,
+        minHeight: 2,
+        flexGrow: 1,
+        flexShrink: 0,
+        flexDirection: "row",
+        backgroundColor: palette.panel,
+        visible: false,
+      });
+      const mark = new TextRenderable(renderer, {
+        id: `market-${index}-mark`,
+        width: 5,
+        height: 2,
         content: "",
-        fg: palette.ink,
-        bg: palette.panel,
+        fg: palette.muted,
         truncate: true,
         selectable: false,
       });
-      this.marketRows.push(row);
-      this.marketPanel.add(row);
+      const details = new TextRenderable(renderer, {
+        id: `market-${index}-details`,
+        flexGrow: 1,
+        height: 2,
+        content: "",
+        fg: palette.ink,
+        truncate: true,
+        selectable: false,
+      });
+      container.add(mark);
+      container.add(details);
+      this.marketRows.push({ container, mark, details });
+      this.marketPanel.add(container);
     }
 
     const main = new BoxRenderable(renderer, {
@@ -412,6 +451,7 @@ class MarketDashboard {
       .join("  ");
     this.headerText.content = `MOBIUS / PREDICTION MARKETS     ${this.paused ? "PAUSED" : "LIVE"} ●     ${providerLabel}     ${now}`;
 
+    const visibleRowCount = marketRowCapacity(this.renderer.height, markets.length);
     const pageStart = Math.max(
       0,
       Math.min(
@@ -421,28 +461,32 @@ class MarketDashboard {
     );
     const visible = markets.slice(pageStart, pageStart + visibleRowCount);
     const watchlistKeys = new Set(this.watchlist.map((item) => item.key));
-    this.marketRows.forEach((row, rowIndex) => {
+    this.marketRows.forEach(({ container, mark, details }, rowIndex) => {
+      container.visible = rowIndex < visibleRowCount;
+      if (!container.visible) return;
       const index = pageStart + rowIndex;
       const item = visible[rowIndex];
       if (!item) {
-        row.content = rowIndex === 0 && markets.length === 0
+        mark.content = "";
+        details.content = rowIndex === 0 && markets.length === 0
           ? `  ${this.watchlistOnly ? "No watched markets are currently loaded." : "Connecting to market providers…"}`
           : "";
-        row.bg = palette.panel;
-        row.fg = palette.muted;
+        container.backgroundColor = palette.panel;
+        details.fg = palette.muted;
         return;
       }
       const active = index === this.selected;
       const star = watchlistKeys.has(item.key) ? "★" : " ";
       const stale = item.stale ? "~" : " ";
-      row.content = `${active ? "▸" : " "}${star}${stale} ${sourceLabel(item).padEnd(6)} ${clip(
-        item.question,
-        28,
-      )}\n    YES ${item.yes.toFixed(1).padStart(5)}c ${signed(item.change).padStart(6)}  VOL ${volumeLabel(
+      mark.content = `${active ? "▸" : " "} ${sourceMark(item)}\n ${star}${stale}`;
+      mark.fg = sourceColor(item);
+      details.content = `${clip(item.question, 31)}\nYES ${item.yes.toFixed(1).padStart(5)}c ${signed(
+        item.change,
+      ).padStart(6)}  VOL ${volumeLabel(
         item,
       ).padStart(7)}`;
-      row.bg = active ? palette.selected : palette.panel;
-      row.fg = active ? palette.green : item.change >= 0 ? palette.ink : palette.red;
+      container.backgroundColor = active ? palette.selected : palette.panel;
+      details.fg = active ? palette.green : item.change >= 0 ? palette.ink : palette.red;
     });
 
     if (!market) {
