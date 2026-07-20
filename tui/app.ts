@@ -6,8 +6,14 @@ import {
   type CliRendererConfig,
   type KeyEvent,
 } from "@opentui/core";
+import type { MarketDataEvent, MarketDataHub } from "../market-data/hub";
+import type { MarketKey, MarketRecord, ProviderStatus } from "../market-data/types";
+import {
+  marketToWatchlistItem,
+  normalizeWatchlist,
+  type WatchlistItem,
+} from "../watchlist/types";
 import { brailleChart, compactNumber, sizeNumber } from "./chart";
-import { cloneMarkets, type Market } from "./markets";
 
 const palette = {
   ink: "#d8e0da",
@@ -22,10 +28,15 @@ const palette = {
   background: "#050907",
 };
 
-type DashboardOptions = Pick<
+const visibleRowCount = 12;
+
+export type DashboardOptions = Pick<
   CliRendererConfig,
   "stdin" | "stdout" | "width" | "height" | "remote"
 > & {
+  marketHub: MarketDataHub;
+  watchlist?: WatchlistItem[];
+  onWatchlistChange?: (items: WatchlistItem[]) => void | Promise<void>;
   onQuit?: () => void;
 };
 
@@ -40,40 +51,59 @@ function signed(value: number): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(1)}`;
 }
 
-function buildBook(market: Market): string {
+function sourceLabel(market: MarketRecord): string {
+  return market.source === "polymarket" ? "POLY" : "KALSHI";
+}
+
+function volumeLabel(market: MarketRecord): string {
+  return market.source === "polymarket" ? compactNumber(market.volume) : sizeNumber(market.volume);
+}
+
+function buildBook(market: MarketRecord): string {
+  if (market.bids.length === 0 && market.asks.length === 0) {
+    return " SIZE     BID PRICE    ASK     SIZE\n\n      Waiting for book data…";
+  }
   const maxSize = Math.max(
+    1,
     ...market.bids.map((level) => level.size),
     ...market.asks.map((level) => level.size),
   );
-  const rows = market.bids.map((bid, index) => {
+  const rowCount = Math.min(5, Math.max(market.bids.length, market.asks.length));
+  const rows = Array.from({ length: rowCount }, (_, index) => {
+    const bid = market.bids[index];
     const ask = market.asks[index];
-    const bidBar = "█".repeat(Math.max(1, Math.round((bid.size / maxSize) * 7)));
-    const askBar = "█".repeat(Math.max(1, Math.round((ask.size / maxSize) * 7)));
-    return `${sizeNumber(bid.size).padStart(5)} ${bidBar.padStart(7)} ${bid.price
-      .toFixed(1)
-      .padStart(5)}  ${ask.price.toFixed(1).padStart(5)} ${askBar.padEnd(7)} ${sizeNumber(
-      ask.size,
-    ).padStart(5)}`;
+    const bidBar = bid ? "█".repeat(Math.max(1, Math.round((bid.size / maxSize) * 7))) : "";
+    const askBar = ask ? "█".repeat(Math.max(1, Math.round((ask.size / maxSize) * 7))) : "";
+    return `${bid ? sizeNumber(bid.size).padStart(5) : "     "} ${bidBar.padStart(7)} ${
+      bid ? bid.price.toFixed(1).padStart(5) : "     "
+    }  ${ask ? ask.price.toFixed(1).padStart(5) : "     "} ${askBar.padEnd(7)} ${
+      ask ? sizeNumber(ask.size).padStart(5) : "     "
+    }`;
   });
-
   return [" SIZE     BID PRICE    ASK     SIZE", ...rows].join("\n");
 }
 
-function buildTrades(market: Market): string {
+function buildTrades(market: MarketRecord): string {
+  if (market.trades.length === 0) return "TIME      SIDE  PRICE   SIZE\n\nWaiting for trades…";
   return [
     "TIME      SIDE  PRICE   SIZE",
-    ...market.trades.map(
-      (trade) =>
-        `${trade.time}  ${trade.side.padEnd(4)}  ${trade.price
-          .toFixed(1)
-          .padStart(5)}c  ${sizeNumber(trade.size).padStart(5)}`,
-    ),
+    ...market.trades.slice(0, 5).map((trade) => {
+      const time = new Date(trade.timestamp).toLocaleTimeString("en-US", {
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+      return `${time}  ${trade.side.padEnd(4)}  ${trade.price
+        .toFixed(1)
+        .padStart(5)}c  ${sizeNumber(trade.size).padStart(5)}`;
+    }),
   ].join("\n");
 }
 
 class MarketDashboard {
   private readonly renderer: CliRenderer;
-  private readonly markets = cloneMarkets();
+  private readonly hub: MarketDataHub;
   private readonly marketRows: TextRenderable[] = [];
   private readonly marketPanel: BoxRenderable;
   private readonly lowerPanel: BoxRenderable;
@@ -83,17 +113,24 @@ class MarketDashboard {
   private readonly tradesText: TextRenderable;
   private readonly headerText: TextRenderable;
   private readonly footerText: TextRenderable;
+  private readonly onWatchlistChange?: (items: WatchlistItem[]) => void | Promise<void>;
   private readonly onQuit?: () => void;
+  private readonly marketsByKey = new Map<MarketKey, MarketRecord>();
+  private readonly providers = new Map<MarketRecord["source"], ProviderStatus>();
+  private watchlist: WatchlistItem[];
+  private unsubscribe: () => void;
   private selected = 0;
   private timeframe: Timeframe = "24H";
   private paused = false;
+  private watchlistOnly = false;
   private disposed = false;
-  private tick = 0;
-  private timer: ReturnType<typeof setInterval>;
 
-  constructor(renderer: CliRenderer, onQuit?: () => void) {
+  constructor(renderer: CliRenderer, options: DashboardOptions) {
     this.renderer = renderer;
-    this.onQuit = onQuit;
+    this.hub = options.marketHub;
+    this.watchlist = normalizeWatchlist(options.watchlist ?? []);
+    this.onWatchlistChange = options.onWatchlistChange;
+    this.onQuit = options.onQuit;
 
     const root = new BoxRenderable(renderer, {
       id: "mobius-root",
@@ -136,7 +173,7 @@ class MarketDashboard {
 
     this.marketPanel = new BoxRenderable(renderer, {
       id: "markets",
-      width: 38,
+      width: 42,
       height: "100%",
       flexDirection: "column",
       border: true,
@@ -147,21 +184,22 @@ class MarketDashboard {
       padding: 1,
       backgroundColor: palette.panel,
     });
-    const marketHeader = new TextRenderable(renderer, {
-      id: "market-header",
-      width: "100%",
-      height: 2,
-      content: "SELECT A CONTRACT\n──────────────────────────────────",
-      fg: palette.muted,
-      selectable: false,
-    });
-    this.marketPanel.add(marketHeader);
+    this.marketPanel.add(
+      new TextRenderable(renderer, {
+        id: "market-header",
+        width: "100%",
+        height: 2,
+        content: "PROVIDER  CONTRACT                         \n──────────────────────────────────────",
+        fg: palette.muted,
+        selectable: false,
+      }),
+    );
 
-    for (let index = 0; index < this.markets.length; index += 1) {
+    for (let index = 0; index < visibleRowCount; index += 1) {
       const row = new TextRenderable(renderer, {
         id: `market-${index}`,
         width: "100%",
-        height: 3,
+        height: 2,
         content: "",
         fg: palette.ink,
         bg: palette.panel,
@@ -286,15 +324,42 @@ class MarketDashboard {
     renderer.root.add(root);
 
     renderer.keyInput.on("keypress", this.handleKey);
-    this.timer = setInterval(() => this.updateMarketData(), 1_100);
+    this.unsubscribe = this.hub.subscribe(this.handleMarketEvent);
     this.render();
   }
 
+  private get markets(): MarketRecord[] {
+    const all = [...this.marketsByKey.values()].sort((a, b) => {
+      if (a.source !== b.source) return a.source.localeCompare(b.source);
+      return b.volume - a.volume;
+    });
+    if (!this.watchlistOnly) return all;
+    const keys = new Set(this.watchlist.map((item) => item.key));
+    return all.filter((market) => keys.has(market.key));
+  }
+
+  private readonly handleMarketEvent = (event: MarketDataEvent) => {
+    if (event.type === "snapshot") {
+      this.marketsByKey.clear();
+      for (const market of event.markets) this.marketsByKey.set(market.key, market);
+      this.providers.clear();
+      for (const provider of event.providers) this.providers.set(provider.source, provider);
+    } else if (event.type === "market.upsert") {
+      this.marketsByKey.set(event.market.key, event.market);
+    } else if (event.type === "market.remove") {
+      this.marketsByKey.delete(event.key);
+    } else if (event.type === "provider.status") {
+      this.providers.set(event.provider.source, event.provider);
+    }
+    if (!this.paused) this.render();
+  };
+
   private readonly handleKey = (key: KeyEvent) => {
-    if (key.name === "down" || key.name === "j") {
-      this.selected = (this.selected + 1) % this.markets.length;
-    } else if (key.name === "up" || key.name === "k") {
-      this.selected = (this.selected - 1 + this.markets.length) % this.markets.length;
+    const markets = this.markets;
+    if ((key.name === "down" || key.name === "j") && markets.length > 0) {
+      this.selected = (this.selected + 1) % markets.length;
+    } else if ((key.name === "up" || key.name === "k") && markets.length > 0) {
+      this.selected = (this.selected - 1 + markets.length) % markets.length;
     } else if (key.name === "1") {
       this.timeframe = "1H";
     } else if (key.name === "2") {
@@ -303,6 +368,11 @@ class MarketDashboard {
       this.timeframe = "7D";
     } else if (key.name === "p" || key.name === "space") {
       this.paused = !this.paused;
+    } else if (key.name === "w" && markets[this.selected]) {
+      this.toggleWatchlist(markets[this.selected]);
+    } else if (key.name === "f") {
+      this.watchlistOnly = !this.watchlistOnly;
+      this.selected = 0;
     } else if (key.name === "q" || (key.name === "c" && key.ctrl)) {
       this.dispose();
       return;
@@ -314,104 +384,121 @@ class MarketDashboard {
     this.render();
   };
 
-  private updateMarketData() {
-    if (this.paused || this.disposed) return;
-    this.tick += 1;
-
-    for (let index = 0; index < this.markets.length; index += 1) {
-      const market = this.markets[index];
-      const wave = Math.sin((this.tick + index * 2.3) / 3.1) * 0.12;
-      const jitter = (Math.random() - 0.5) * 0.24;
-      const next = Math.min(99, Math.max(1, market.yes + wave + jitter));
-      market.change += next - market.yes;
-      market.yes = next;
-      market.history.push(next);
-      if (market.history.length > 180) market.history.shift();
-      market.volume += Math.round(550 + Math.random() * 2_400);
-
-      for (const level of market.bids) level.price = Math.max(1, level.price + jitter * 0.2);
-      for (const level of market.asks) level.price = Math.min(99, level.price + jitter * 0.2);
-    }
-
-    const current = this.markets[this.selected];
-    const now = new Date().toLocaleTimeString("en-US", { hour12: false });
-    current.trades.unshift({
-      time: now,
-      side: Math.random() > 0.36 ? "YES" : "NO",
-      price: Math.random() > 0.36 ? current.yes : 100 - current.yes,
-      size: Math.round(40 + Math.random() * 1_200),
-    });
-    current.trades = current.trades.slice(0, 5);
+  setWatchlist(items: WatchlistItem[]): void {
+    this.watchlist = normalizeWatchlist(items);
+    if (this.selected >= this.markets.length) this.selected = Math.max(0, this.markets.length - 1);
     this.render();
   }
 
-  private render() {
-    const market = this.markets[this.selected];
+  private toggleWatchlist(market: MarketRecord): void {
+    const index = this.watchlist.findIndex((item) => item.key === market.key);
+    if (index >= 0) this.watchlist.splice(index, 1);
+    else this.watchlist.push(marketToWatchlistItem(market, this.watchlist.length));
+    this.watchlist = normalizeWatchlist(this.watchlist);
+    void this.onWatchlistChange?.(this.watchlist);
+  }
+
+  private render(): void {
+    const markets = this.markets;
+    if (this.selected >= markets.length) this.selected = Math.max(0, markets.length - 1);
+    const market = markets[this.selected];
     const now = new Date().toLocaleTimeString("en-US", { hour12: false });
-    const connection = this.paused ? "PAUSED" : "LIVE";
-    const compact = this.renderer.width < 92;
+    const compact = this.renderer.width < 96;
     this.marketPanel.visible = !compact;
     this.lowerPanel.visible = !compact && this.renderer.height >= 32;
 
-    this.headerText.content = `MOBIUS / PREDICTION MARKETS     ${connection} ●     DEMO FEED     ${now}`;
+    const providerLabel = (["polymarket", "kalshi"] as const)
+      .map((source) => `${source === "polymarket" ? "POLY" : "KALSHI"}:${this.providers.get(source)?.state ?? "connecting"}`)
+      .join("  ");
+    this.headerText.content = `MOBIUS / PREDICTION MARKETS     ${this.paused ? "PAUSED" : "LIVE"} ●     ${providerLabel}     ${now}`;
 
-    this.marketRows.forEach((row, index) => {
-      const item = this.markets[index];
+    const pageStart = Math.max(
+      0,
+      Math.min(
+        Math.max(0, markets.length - visibleRowCount),
+        this.selected - Math.floor(visibleRowCount / 2),
+      ),
+    );
+    const visible = markets.slice(pageStart, pageStart + visibleRowCount);
+    const watchlistKeys = new Set(this.watchlist.map((item) => item.key));
+    this.marketRows.forEach((row, rowIndex) => {
+      const index = pageStart + rowIndex;
+      const item = visible[rowIndex];
+      if (!item) {
+        row.content = rowIndex === 0 && markets.length === 0
+          ? `  ${this.watchlistOnly ? "No watched markets are currently loaded." : "Connecting to market providers…"}`
+          : "";
+        row.bg = palette.panel;
+        row.fg = palette.muted;
+        return;
+      }
       const active = index === this.selected;
-      const movement = signed(item.change);
-      row.content = `${active ? "▸" : " "} ${item.category.padEnd(9)} ${clip(
+      const star = watchlistKeys.has(item.key) ? "★" : " ";
+      const stale = item.stale ? "~" : " ";
+      row.content = `${active ? "▸" : " "}${star}${stale} ${sourceLabel(item).padEnd(6)} ${clip(
         item.question,
-        22,
-      )}\n  YES ${item.yes.toFixed(1).padStart(5)}c  ${movement.padStart(6)}  VOL ${compactNumber(
-        item.volume,
-      ).padStart(6)}`;
+        28,
+      )}\n    YES ${item.yes.toFixed(1).padStart(5)}c ${signed(item.change).padStart(6)}  VOL ${volumeLabel(
+        item,
+      ).padStart(7)}`;
       row.bg = active ? palette.selected : palette.panel;
       row.fg = active ? palette.green : item.change >= 0 ? palette.ink : palette.red;
     });
 
-    const sampleCount = this.timeframe === "1H" ? 24 : this.timeframe === "24H" ? 72 : 180;
-    const plotWidth = Math.max(
-      18,
-      Math.min(92, compact ? this.renderer.width - 8 : this.renderer.width - 48),
-    );
-    const plotRows = Math.max(
-      5,
-      Math.min(15, this.renderer.height - (this.lowerPanel.visible ? 22 : 11)),
-    );
-    const series = market.history.slice(-sampleCount);
-    const movementColor = market.change >= 0 ? "UP" : "DOWN";
-
-    this.chartPanel.title = ` ${clip(market.question.toUpperCase(), Math.max(24, plotWidth - 8))} `;
-    this.chartText.content = [
-      `YES ${market.yes.toFixed(1)}c  ${signed(market.change)} pts ${movementColor}   ${this.timeframe}   VOL ${compactNumber(
-        market.volume,
-      )}   LIQ ${compactNumber(market.liquidity)}`,
-      "",
-      brailleChart(series, plotWidth, plotRows),
-    ].join("\n");
-    this.bookText.content = buildBook(market);
-    this.tradesText.content = buildTrades(market);
+    if (!market) {
+      this.chartPanel.title = " PROBABILITY ";
+      this.chartText.content = this.watchlistOnly
+        ? "Watchlist is empty or its markets are not in the current feed.\n\nPress f to show all markets, then w to add one."
+        : "Loading real-time Polymarket and Kalshi markets…";
+      this.bookText.content = "Waiting for market selection…";
+      this.tradesText.content = "Waiting for market selection…";
+    } else {
+      const sampleCount = this.timeframe === "1H" ? 60 : this.timeframe === "24H" ? 144 : 360;
+      const plotWidth = Math.max(
+        18,
+        Math.min(92, compact ? this.renderer.width - 8 : this.renderer.width - 52),
+      );
+      const plotRows = Math.max(
+        5,
+        Math.min(15, this.renderer.height - (this.lowerPanel.visible ? 22 : 11)),
+      );
+      const series = market.history.length > 0 ? market.history.slice(-sampleCount) : [market.yes];
+      this.chartPanel.title = ` ${sourceLabel(market)} / ${clip(
+        market.question.toUpperCase(),
+        Math.max(24, plotWidth - 14),
+      )} `;
+      this.chartText.content = [
+        `YES ${market.yes.toFixed(1)}c  ${signed(market.change)} pts   ${this.timeframe}   VOL ${volumeLabel(
+          market,
+        )}   LIQ ${compactNumber(market.liquidity)}${market.stale ? "   STALE" : ""}`,
+        "",
+        brailleChart(series, plotWidth, plotRows),
+      ].join("\n");
+      this.bookText.content = buildBook(market);
+      this.tradesText.content = buildTrades(market);
+    }
+    this.marketPanel.title = ` ${this.watchlistOnly ? "WATCHLIST" : "MARKETS"} ${markets.length} `;
     this.footerText.content =
-      "↑/k ↓/j select   1 1H   2 24H   3 7D   p pause   q quit     simulated data • OpenTUI 0.4";
+      "↑/k ↓/j select   w watch   f filter   1 1H   2 24H   3 7D   p pause   q quit     real provider feeds";
     this.renderer.requestRender();
   }
 
-  resize(width: number, height: number) {
+  resize(width: number, height: number): void {
     this.renderer.resize(Math.max(40, width), Math.max(22, height));
     this.render();
   }
 
-  dispose() {
+  dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    clearInterval(this.timer);
+    this.unsubscribe();
     this.renderer.keyInput.off("keypress", this.handleKey);
     this.renderer.destroy();
     this.onQuit?.();
   }
 }
 
-export async function createMarketDashboard(options: DashboardOptions = {}) {
+export async function createMarketDashboard(options: DashboardOptions) {
   const renderer = await createCliRenderer({
     stdin: options.stdin,
     stdout: options.stdout,
@@ -429,5 +516,5 @@ export async function createMarketDashboard(options: DashboardOptions = {}) {
     backgroundColor: palette.background,
   });
 
-  return new MarketDashboard(renderer, options.onQuit);
+  return new MarketDashboard(renderer, options);
 }

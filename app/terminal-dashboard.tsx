@@ -3,17 +3,22 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { useEffect, useRef, useState } from "react";
+import { loadBrowserWatchlist, replaceBrowserWatchlist } from "../watchlist/browser";
+import type { WatchlistItem } from "../watchlist/types";
 
 type ConnectionState = "connecting" | "live" | "offline";
 
 type BridgeMessage =
   | { type: "output"; data: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "watchlist.persist"; items: WatchlistItem[] }
+  | { type: "watchlist.ack"; count: number };
 
 export function TerminalDashboard() {
   const hostRef = useRef<HTMLDivElement>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [attempt, setAttempt] = useState(0);
+  const [watchlistCount, setWatchlistCount] = useState(0);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -60,11 +65,24 @@ export function TerminalDashboard() {
     const socket = new WebSocket(
       `${protocol}//${bridgeHost}/terminal?cols=${terminal.cols}&rows=${terminal.rows}`,
     );
+    let localWatchlist: WatchlistItem[] = [];
+    void loadBrowserWatchlist()
+      .then((items) => {
+        localWatchlist = items;
+        setWatchlistCount(items.length);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "watchlist.sync", items }));
+        }
+      })
+      .catch(() => {
+        terminal.writeln("\r\n\x1b[38;2;255;200;97mLocal watchlist storage is unavailable.\x1b[0m");
+      });
 
     socket.addEventListener("open", () => {
       setConnection("live");
       terminal.clear();
       terminal.focus();
+      socket.send(JSON.stringify({ type: "watchlist.sync", items: localWatchlist }));
     });
 
     socket.addEventListener("message", (event) => {
@@ -74,6 +92,14 @@ export function TerminalDashboard() {
         if (message.type === "error") {
           terminal.writeln(`\r\n\x1b[38;2;255;113;133m${message.message}\x1b[0m`);
         }
+        if (message.type === "watchlist.persist") {
+          localWatchlist = message.items;
+          setWatchlistCount(message.items.length);
+          void replaceBrowserWatchlist(message.items).catch(() => {
+            terminal.writeln("\r\n\x1b[38;2;255;200;97mCould not persist the watchlist locally.\x1b[0m");
+          });
+        }
+        if (message.type === "watchlist.ack") setWatchlistCount(message.count);
       } catch {
         terminal.write(String(event.data));
       }
@@ -146,15 +172,17 @@ export function TerminalDashboard() {
       <section className="terminal-frame" aria-label="Interactive prediction market terminal">
         <div className="terminal-chrome" aria-hidden="true">
           <div className="window-controls"><i /><i /><i /></div>
-          <span>mobius — opentui / demo-feed</span>
-          <span>{connection === "live" ? "20 fps" : "waiting"}</span>
+          <span>mobius — opentui / polymarket + kalshi</span>
+          <span>{connection === "live" ? `${watchlistCount} watched` : "waiting"}</span>
         </div>
         <div ref={hostRef} className="terminal-host" />
       </section>
 
       <footer className="site-footer">
-        <p>Navigate with <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd></p>
-        <p>Simulated market data · initial OpenTUI prototype</p>
+        <p>
+          Navigate with <kbd>↑</kbd> <kbd>↓</kbd> · <kbd>w</kbd> watch · <kbd>f</kbd> filter
+        </p>
+        <p>Live provider rows · watchlist stored on this device</p>
       </footer>
     </main>
   );

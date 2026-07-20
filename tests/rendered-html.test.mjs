@@ -33,6 +33,8 @@ test("server-renders the Mobius browser terminal shell", async () => {
   assert.match(html, /MOBIUS/);
   assert.match(html, /PREDICTION MARKET TERMINAL/);
   assert.match(html, /Interactive prediction market terminal/);
+  assert.match(html, /property="og:image"/);
+  assert.match(html, /\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|SkeletonPreview/);
 });
 
