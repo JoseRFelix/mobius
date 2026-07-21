@@ -1,3 +1,4 @@
+import { resolveMarketPageSize } from "./config";
 import { KalshiProvider } from "./providers/kalshi";
 import { PolymarketProvider } from "./providers/polymarket";
 import { snapshotMessage, type MarketDataServerMessage } from "./protocol";
@@ -17,13 +18,14 @@ export class MarketDataHub {
   private readonly statuses = new Map<MarketSource, ProviderStatus>();
   private readonly listeners = new Set<MarketDataListener>();
   private startPromise?: Promise<void>;
+  private loadMorePromise?: Promise<number>;
   private stopped = false;
 
   constructor(options: MarketDataHubOptions = {}) {
-    const maxMarkets = Number(process.env.MARKET_LIMIT ?? 10);
+    const pageSize = resolveMarketPageSize();
     this.providers = options.providers ?? [
-      new PolymarketProvider({ maxMarkets }),
-      new KalshiProvider({ maxMarkets }),
+      new PolymarketProvider({ pageSize }),
+      new KalshiProvider({ pageSize }),
     ];
 
     for (const provider of this.providers) {
@@ -75,6 +77,45 @@ export class MarketDataHub {
 
   getProviderStatuses(): ProviderStatus[] {
     return [...this.statuses.values()].sort((a, b) => a.source.localeCompare(b.source));
+  }
+
+  canLoadMore(): boolean {
+    return this.providers.some(
+      (provider) => provider.loadMore != null && provider.hasMore !== false,
+    );
+  }
+
+  async loadMore(): Promise<number> {
+    if (this.loadMorePromise) return this.loadMorePromise;
+    await this.start();
+    const providers = this.providers.filter(
+      (provider) => provider.loadMore != null && provider.hasMore !== false,
+    );
+    if (providers.length === 0) return 0;
+
+    this.loadMorePromise = Promise.allSettled(
+      providers.map((provider) => provider.loadMore!()),
+    ).then((results) => {
+      const failures = results.filter(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failures.length === results.length) {
+        throw new AggregateError(
+          failures.map((failure) => failure.reason),
+          "Every provider failed to load another market page",
+        );
+      }
+      return results.reduce(
+        (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+        0,
+      );
+    });
+
+    try {
+      return await this.loadMorePromise;
+    } finally {
+      this.loadMorePromise = undefined;
+    }
   }
 
   private upsert(market: MarketRecord): void {

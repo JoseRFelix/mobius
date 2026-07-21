@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { constants, createSign } from "node:crypto";
 import { z } from "zod";
+import { DEFAULT_MARKET_PAGE_SIZE, MAX_MARKET_PAGE_SIZE } from "../config";
 import { logger } from "../logger";
 import { providerStatus, type MarketProvider, type ProviderCallbacks } from "../provider";
 import { asCents, asNumber, marketKey, type MarketRecord, type OrderLevel } from "../types";
@@ -132,7 +133,7 @@ export function createKalshiHeaders(
 
 type KalshiProviderOptions = {
   fetcher?: typeof fetch;
-  maxMarkets?: number;
+  pageSize?: number;
   refreshMs?: number;
   keyId?: string;
   privateKey?: string;
@@ -141,7 +142,7 @@ type KalshiProviderOptions = {
 export class KalshiProvider implements MarketProvider {
   readonly source = "kalshi" as const;
   private readonly fetcher: typeof fetch;
-  private readonly maxMarkets: number;
+  private readonly pageSize: number;
   private readonly refreshMs: number;
   private readonly keyId?: string;
   private readonly privateKey?: string;
@@ -151,14 +152,24 @@ export class KalshiProvider implements MarketProvider {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private socket?: WebSocket;
   private reconnectAttempts = 0;
+  private nextCursor?: string;
+  private paginationExhausted = false;
+  private pageLoadPromise?: Promise<number>;
   private readonly marketsByTicker = new Map<string, MarketRecord>();
 
   constructor(options: KalshiProviderOptions = {}) {
     this.fetcher = options.fetcher ?? fetch;
-    this.maxMarkets = options.maxMarkets ?? 10;
+    this.pageSize = Math.min(
+      MAX_MARKET_PAGE_SIZE,
+      Math.max(1, Math.floor(options.pageSize ?? DEFAULT_MARKET_PAGE_SIZE)),
+    );
     this.refreshMs = options.refreshMs ?? 30_000;
     this.keyId = options.keyId ?? process.env.KALSHI_API_KEY_ID;
     this.privateKey = options.privateKey ?? loadPrivateKey();
+  }
+
+  get hasMore(): boolean {
+    return !this.paginationExhausted;
   }
 
   async start(callbacks: ProviderCallbacks): Promise<void> {
@@ -196,28 +207,59 @@ export class KalshiProvider implements MarketProvider {
     this.callbacks = undefined;
   }
 
+  async loadMore(): Promise<number> {
+    if (this.pageLoadPromise) return this.pageLoadPromise;
+    if (this.paginationExhausted || !this.nextCursor) {
+      this.paginationExhausted = true;
+      return 0;
+    }
+
+    const cursor = this.nextCursor;
+    this.pageLoadPromise = this.fetchAndApplyPage(cursor, true);
+    try {
+      return await this.pageLoadPromise;
+    } catch (error) {
+      this.callbacks?.status(providerStatus(this.source, "stale", "Could not load next page"));
+      throw error;
+    } finally {
+      this.pageLoadPromise = undefined;
+    }
+  }
+
   private async refreshMarkets(): Promise<void> {
+    await this.fetchAndApplyPage(undefined, this.marketsByTicker.size === 0);
+  }
+
+  private async fetchAndApplyPage(
+    cursor: string | undefined,
+    advancePagination: boolean,
+  ): Promise<number> {
     const url = new URL(`${REST_BASE_URL}/markets`);
     url.searchParams.set("status", "open");
-    url.searchParams.set("limit", "250");
+    url.searchParams.set("limit", String(this.pageSize));
     url.searchParams.set("mve_filter", "exclude");
+    if (cursor) url.searchParams.set("cursor", cursor);
     const response = await this.fetcher(url);
     if (!response.ok) throw new Error(`Kalshi discovery returned ${response.status}`);
     const payload = kalshiMarketsResponseSchema.parse(await response.json());
+    if (advancePagination) {
+      this.nextCursor = payload.cursor;
+      this.paginationExhausted = !payload.cursor;
+    }
     const selected = [...payload.markets]
       .sort(
         (a, b) =>
           asNumber(b.volume_24h_fp ?? b.volume_fp) - asNumber(a.volume_24h_fp ?? a.volume_fp),
-      )
-      .slice(0, this.maxMarkets);
+      );
 
     const history = await this.fetchHistory(selected.map((market) => market.ticker));
     const previousTickers = new Set(this.marketsByTicker.keys());
-    const nextTickers = new Set<string>();
+    let added = 0;
 
     for (const raw of selected) {
       const normalized = normalizeKalshiMarket(raw, history.get(raw.ticker));
       const existing = this.marketsByTicker.get(raw.ticker);
+      if (!existing) added += 1;
       const market = existing
         ? {
             ...normalized,
@@ -229,20 +271,11 @@ export class KalshiProvider implements MarketProvider {
         : normalized;
       market.change = market.yes - market.history[0];
       this.marketsByTicker.set(raw.ticker, market);
-      nextTickers.add(raw.ticker);
       this.callbacks?.upsert(market);
     }
 
-    for (const ticker of previousTickers) {
-      if (nextTickers.has(ticker)) continue;
-      const removed = this.marketsByTicker.get(ticker);
-      if (removed) this.callbacks?.remove(removed.key);
-      this.marketsByTicker.delete(ticker);
-    }
-
     const membershipChanged =
-      previousTickers.size !== nextTickers.size ||
-      [...previousTickers].some((ticker) => !nextTickers.has(ticker));
+      previousTickers.size !== this.marketsByTicker.size;
     if (membershipChanged && this.socket?.readyState === WebSocket.OPEN) {
       this.socket.close(1000, "Refreshing market subscriptions");
     } else if (this.keyId && this.privateKey && !this.socket) {
@@ -254,10 +287,12 @@ export class KalshiProvider implements MarketProvider {
         this.source,
         this.socket?.readyState === WebSocket.OPEN ? "live" : "polling",
         this.socket?.readyState === WebSocket.OPEN
-          ? `${nextTickers.size} streaming markets`
-          : `${nextTickers.size} markets via REST`,
+          ? `${this.marketsByTicker.size} streaming markets`
+          : `${this.marketsByTicker.size} markets via REST${this.hasMore ? " · more available" : ""}`,
       ),
     );
+
+    return added;
   }
 
   private async fetchHistory(tickers: string[]): Promise<Map<string, number[]>> {

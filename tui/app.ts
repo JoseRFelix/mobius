@@ -28,7 +28,7 @@ const palette = {
   background: "#050907",
 };
 
-const maxMarketRows = 40;
+export const MAX_RENDERED_MARKET_ROWS = 40;
 
 export type DashboardOptions = Pick<
   CliRendererConfig,
@@ -59,7 +59,7 @@ function sourceMark(market: MarketRecord): string {
   return market.source === "polymarket" ? "P" : "K";
 }
 
-function sourceBadgeColor(market: MarketRecord): string {
+function sourceColor(market: MarketRecord): string {
   return market.source === "polymarket" ? "#6f8cff" : palette.green;
 }
 
@@ -70,7 +70,84 @@ function volumeLabel(market: MarketRecord): string {
 export function marketRowCapacity(viewportHeight: number, marketCount: number): number {
   const availableHeight = Math.max(2, viewportHeight - 14);
   const rowsThatFit = Math.max(1, Math.floor(availableHeight / 2));
-  return Math.min(maxMarketRows, Math.max(1, marketCount), rowsThatFit);
+  return Math.min(MAX_RENDERED_MARKET_ROWS, Math.max(1, marketCount), rowsThatFit);
+}
+
+export function marketWindow(
+  viewportHeight: number,
+  marketCount: number,
+  selected: number,
+): { start: number; end: number; size: number } {
+  const size = marketRowCapacity(viewportHeight, marketCount);
+  const clampedSelected = Math.min(Math.max(0, selected), Math.max(0, marketCount - 1));
+  const start = Math.max(
+    0,
+    Math.min(
+      Math.max(0, marketCount - size),
+      clampedSelected - Math.floor(size / 2),
+    ),
+  );
+  return { start, end: Math.min(marketCount, start + size), size };
+}
+
+function normalizeSearchText(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
+    .trim();
+}
+
+export function searchMarkets(markets: MarketRecord[], query: string): MarketRecord[] {
+  const phrase = normalizeSearchText(query);
+  const terms = [...new Set(phrase.split(/\s+/).filter(Boolean))];
+  if (terms.length === 0) return markets;
+
+  return markets
+    .map((market, originalIndex) => {
+      const question = normalizeSearchText(market.question);
+      const metadata = normalizeSearchText(
+        [
+          market.source,
+          market.source === "polymarket" ? "poly" : "kalshi",
+          market.category,
+          market.marketId,
+          market.outcomeId ?? "",
+          market.url ?? "",
+        ].join(" "),
+      );
+      const questionTokens = new Set(question.split(" "));
+      const metadataTokens = new Set(metadata.split(" "));
+      let score = 0;
+      let matchedTerms = 0;
+
+      for (const term of terms) {
+        if (questionTokens.has(term)) score += 60;
+        else if (question.includes(term)) score += 40;
+        else if (metadataTokens.has(term)) score += 25;
+        else if (metadata.includes(term)) score += 15;
+        else continue;
+        matchedTerms += 1;
+      }
+
+      if (matchedTerms === 0) return null;
+      if (question === phrase) score += 300;
+      else if (question.includes(phrase)) score += 180;
+      if (matchedTerms === terms.length) score += 100;
+      score += matchedTerms * 10;
+
+      return { market, originalIndex, score, matchedTerms };
+    })
+    .filter((result): result is NonNullable<typeof result> => result != null)
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.matchedTerms - a.matchedTerms ||
+        b.market.volume - a.market.volume ||
+        a.originalIndex - b.originalIndex,
+    )
+    .map((result) => result.market);
 }
 
 function buildBook(market: MarketRecord): string {
@@ -120,9 +197,7 @@ class MarketDashboard {
   private readonly hub: MarketDataHub;
   private readonly marketRows: Array<{
     container: BoxRenderable;
-    status: TextRenderable;
-    badge: BoxRenderable;
-    badgeLetter: TextRenderable;
+    mark: TextRenderable;
     details: TextRenderable;
   }> = [];
   private readonly marketPanel: BoxRenderable;
@@ -143,6 +218,10 @@ class MarketDashboard {
   private timeframe: Timeframe = "24H";
   private paused = false;
   private watchlistOnly = false;
+  private searchActive = false;
+  private searchQuery = "";
+  private loadingMore = false;
+  private loadMoreFailed = false;
   private disposed = false;
 
   constructor(renderer: CliRenderer, options: DashboardOptions) {
@@ -215,7 +294,7 @@ class MarketDashboard {
       }),
     );
 
-    for (let index = 0; index < maxMarketRows; index += 1) {
+    for (let index = 0; index < MAX_RENDERED_MARKET_ROWS; index += 1) {
       const container = new BoxRenderable(renderer, {
         id: `market-${index}`,
         width: "100%",
@@ -224,33 +303,15 @@ class MarketDashboard {
         flexGrow: 1,
         flexShrink: 0,
         flexDirection: "row",
-        alignItems: "flex-start",
         backgroundColor: palette.panel,
         visible: false,
       });
-      const status = new TextRenderable(renderer, {
-        id: `market-${index}-status`,
-        width: 2,
+      const mark = new TextRenderable(renderer, {
+        id: `market-${index}-mark`,
+        width: 5,
         height: 2,
         content: "",
         fg: palette.muted,
-        truncate: true,
-        selectable: false,
-      });
-      const badge = new BoxRenderable(renderer, {
-        id: `market-${index}-badge`,
-        width: 3,
-        height: 1,
-        justifyContent: "center",
-        alignItems: "center",
-        backgroundColor: palette.muted,
-      });
-      const badgeLetter = new TextRenderable(renderer, {
-        id: `market-${index}-badge-letter`,
-        width: 1,
-        height: 1,
-        content: "",
-        fg: palette.background,
         truncate: true,
         selectable: false,
       });
@@ -258,17 +319,14 @@ class MarketDashboard {
         id: `market-${index}-details`,
         flexGrow: 1,
         height: 2,
-        marginLeft: 1,
         content: "",
         fg: palette.ink,
         truncate: true,
         selectable: false,
       });
-      badge.add(badgeLetter);
-      container.add(status);
-      container.add(badge);
+      container.add(mark);
       container.add(details);
-      this.marketRows.push({ container, status, badge, badgeLetter, details });
+      this.marketRows.push({ container, mark, details });
       this.marketPanel.add(container);
     }
 
@@ -390,7 +448,7 @@ class MarketDashboard {
     this.render();
   }
 
-  private get markets(): MarketRecord[] {
+  private get baseMarkets(): MarketRecord[] {
     const all = [...this.marketsByKey.values()].sort((a, b) => {
       if (a.source !== b.source) return a.source.localeCompare(b.source);
       return b.volume - a.volume;
@@ -400,7 +458,12 @@ class MarketDashboard {
     return all.filter((market) => keys.has(market.key));
   }
 
+  private get markets(): MarketRecord[] {
+    return searchMarkets(this.baseMarkets, this.searchQuery);
+  }
+
   private readonly handleMarketEvent = (event: MarketDataEvent) => {
+    const selectedKey = this.markets[this.selected]?.key;
     if (event.type === "snapshot") {
       this.marketsByKey.clear();
       for (const market of event.markets) this.marketsByKey.set(market.key, market);
@@ -413,15 +476,75 @@ class MarketDashboard {
     } else if (event.type === "provider.status") {
       this.providers.set(event.provider.source, event.provider);
     }
+    if (selectedKey) {
+      const selectedIndex = this.markets.findIndex((market) => market.key === selectedKey);
+      if (selectedIndex >= 0) this.selected = selectedIndex;
+    }
     if (!this.paused) this.render();
   };
 
   private readonly handleKey = (key: KeyEvent) => {
+    if (key.name === "c" && key.ctrl) {
+      this.dispose();
+      return;
+    }
+
+    if (this.searchActive) {
+      if (key.name === "escape") {
+        this.searchActive = false;
+        this.searchQuery = "";
+      } else if (key.name === "enter" || key.name === "return") {
+        this.searchActive = false;
+        if (this.searchQuery) this.requestMore(true);
+      } else if (key.name === "backspace") {
+        this.searchQuery = Array.from(this.searchQuery).slice(0, -1).join("");
+        this.selected = 0;
+      } else if (key.ctrl && key.name === "u") {
+        this.searchQuery = "";
+        this.selected = 0;
+      } else if (
+        !key.ctrl &&
+        !key.meta &&
+        !key.option &&
+        Array.from(key.sequence).length === 1 &&
+        key.sequence >= " " &&
+        this.searchQuery.length < 64
+      ) {
+        this.searchQuery += key.sequence;
+        this.selected = 0;
+      } else {
+        return;
+      }
+      key.preventDefault();
+      this.render();
+      return;
+    }
+
     const markets = this.markets;
+    const pageSize = marketRowCapacity(this.renderer.height, markets.length);
+    let requestNextPage = false;
     if ((key.name === "down" || key.name === "j") && markets.length > 0) {
-      this.selected = (this.selected + 1) % markets.length;
+      if (this.selected < markets.length - 1) this.selected += 1;
+      else if (this.hub.canLoadMore()) requestNextPage = true;
+      else this.selected = 0;
     } else if ((key.name === "up" || key.name === "k") && markets.length > 0) {
       this.selected = (this.selected - 1 + markets.length) % markets.length;
+    } else if (key.name === "pagedown" && markets.length > 0) {
+      this.selected = Math.min(markets.length - 1, this.selected + pageSize);
+      requestNextPage = this.selected >= markets.length - 1;
+    } else if (key.name === "pageup" && markets.length > 0) {
+      this.selected = Math.max(0, this.selected - pageSize);
+    } else if (key.name === "home" && markets.length > 0) {
+      this.selected = 0;
+    } else if (key.name === "end" && markets.length > 0) {
+      this.selected = markets.length - 1;
+      requestNextPage = true;
+    } else if (key.name === "/" || key.sequence === "/") {
+      this.searchActive = true;
+      this.selected = 0;
+    } else if (key.name === "escape" && this.searchQuery) {
+      this.searchQuery = "";
+      this.selected = 0;
     } else if (key.name === "1") {
       this.timeframe = "1H";
     } else if (key.name === "2") {
@@ -435,7 +558,7 @@ class MarketDashboard {
     } else if (key.name === "f") {
       this.watchlistOnly = !this.watchlistOnly;
       this.selected = 0;
-    } else if (key.name === "q" || (key.name === "c" && key.ctrl)) {
+    } else if (key.name === "q") {
       this.dispose();
       return;
     } else {
@@ -444,7 +567,40 @@ class MarketDashboard {
 
     key.preventDefault();
     this.render();
+    if (requestNextPage || this.shouldPrefetch()) this.requestMore(false);
   };
+
+  private shouldPrefetch(): boolean {
+    if (this.watchlistOnly || !this.hub.canLoadMore()) return false;
+    const markets = this.markets;
+    if (markets.length === 0) return false;
+    const threshold = Math.max(5, marketRowCapacity(this.renderer.height, markets.length));
+    return this.selected >= Math.max(0, markets.length - threshold);
+  }
+
+  private requestMore(fillSearchResults: boolean): void {
+    if (this.loadingMore || this.watchlistOnly || !this.hub.canLoadMore()) return;
+    this.loadingMore = true;
+    this.loadMoreFailed = false;
+    this.render();
+
+    void (async () => {
+      const maxBatches = fillSearchResults ? 8 : 1;
+      const targetMatches = marketRowCapacity(this.renderer.height, MAX_RENDERED_MARKET_ROWS);
+      for (let batch = 0; batch < maxBatches && this.hub.canLoadMore(); batch += 1) {
+        const added = await this.hub.loadMore();
+        if (added === 0 && !this.hub.canLoadMore()) break;
+        if (!fillSearchResults || this.markets.length >= targetMatches) break;
+      }
+    })()
+      .catch(() => {
+        this.loadMoreFailed = true;
+      })
+      .finally(() => {
+        this.loadingMore = false;
+        if (!this.disposed) this.render();
+      });
+  }
 
   setWatchlist(items: WatchlistItem[]): void {
     this.watchlist = normalizeWatchlist(items);
@@ -474,26 +630,26 @@ class MarketDashboard {
       .join("  ");
     this.headerText.content = `MOBIUS / PREDICTION MARKETS     ${this.paused ? "PAUSED" : "LIVE"} ●     ${providerLabel}     ${now}`;
 
-    const visibleRowCount = marketRowCapacity(this.renderer.height, markets.length);
-    const pageStart = Math.max(
-      0,
-      Math.min(
-        Math.max(0, markets.length - visibleRowCount),
-        this.selected - Math.floor(visibleRowCount / 2),
-      ),
-    );
-    const visible = markets.slice(pageStart, pageStart + visibleRowCount);
+    const window = marketWindow(this.renderer.height, markets.length, this.selected);
+    const visibleRowCount = window.size;
+    const pageStart = window.start;
+    const visible = markets.slice(window.start, window.end);
     const watchlistKeys = new Set(this.watchlist.map((item) => item.key));
-    this.marketRows.forEach(({ container, status, badge, badgeLetter, details }, rowIndex) => {
+    this.marketRows.forEach(({ container, mark, details }, rowIndex) => {
       container.visible = rowIndex < visibleRowCount;
       if (!container.visible) return;
       const index = pageStart + rowIndex;
       const item = visible[rowIndex];
       if (!item) {
-        status.content = "";
-        badge.visible = false;
+        mark.content = "";
         details.content = rowIndex === 0 && markets.length === 0
-          ? `  ${this.watchlistOnly ? "No watched markets are currently loaded." : "Connecting to market providers…"}`
+          ? `  ${
+              this.searchQuery
+                ? `No matches for /${clip(this.searchQuery, 19)}`
+                : this.watchlistOnly
+                  ? "No watched markets are currently loaded."
+                  : "Connecting to market providers…"
+            }`
           : "";
         container.backgroundColor = palette.panel;
         details.fg = palette.muted;
@@ -502,12 +658,9 @@ class MarketDashboard {
       const active = index === this.selected;
       const star = watchlistKeys.has(item.key) ? "★" : " ";
       const stale = item.stale ? "~" : " ";
-      status.content = `${active ? "▸" : " "}\n${star}${stale}`;
-      status.fg = active ? palette.green : palette.muted;
-      badge.visible = true;
-      badge.backgroundColor = sourceBadgeColor(item);
-      badgeLetter.content = sourceMark(item);
-      details.content = `${clip(item.question, 30)}\nYES ${item.yes.toFixed(1).padStart(5)}c ${signed(
+      mark.content = `${active ? "▸" : " "} ${sourceMark(item)}\n ${star}${stale}`;
+      mark.fg = sourceColor(item);
+      details.content = `${clip(item.question, 31)}\nYES ${item.yes.toFixed(1).padStart(5)}c ${signed(
         item.change,
       ).padStart(6)}  VOL ${volumeLabel(
         item,
@@ -518,9 +671,13 @@ class MarketDashboard {
 
     if (!market) {
       this.chartPanel.title = " PROBABILITY ";
-      this.chartText.content = this.watchlistOnly
-        ? "Watchlist is empty or its markets are not in the current feed.\n\nPress f to show all markets, then w to add one."
-        : "Loading real-time Polymarket and Kalshi markets…";
+      this.chartText.content = this.searchQuery
+        ? this.loadingMore
+          ? `Searching additional provider pages for /${this.searchQuery}…`
+          : `No markets match /${this.searchQuery}\n\nPress Enter from search to scan more pages, or Esc to clear it.`
+        : this.watchlistOnly
+          ? "Watchlist is empty or its markets are not in the current feed.\n\nPress f to show all markets, then w to add one."
+          : "Loading real-time Polymarket and Kalshi markets…";
       this.bookText.content = "Waiting for market selection…";
       this.tradesText.content = "Waiting for market selection…";
     } else {
@@ -548,9 +705,20 @@ class MarketDashboard {
       this.bookText.content = buildBook(market);
       this.tradesText.content = buildTrades(market);
     }
-    this.marketPanel.title = ` ${this.watchlistOnly ? "WATCHLIST" : "MARKETS"} ${markets.length} `;
-    this.footerText.content =
-      "↑/k ↓/j select   w watch   f filter   1 1H   2 24H   3 7D   p pause   q quit     real provider feeds";
+    const rangeStart = markets.length > 0 ? pageStart + 1 : 0;
+    const rangeEnd = Math.min(markets.length, pageStart + visibleRowCount);
+    const searchStatus = this.searchQuery ? ` /${clip(this.searchQuery, 12)}` : "";
+    const moreStatus = this.loadingMore
+      ? " LOADING…"
+      : this.loadMoreFailed
+        ? " LOAD ERROR"
+        : !this.watchlistOnly && this.hub.canLoadMore()
+          ? "+"
+          : "";
+    this.marketPanel.title = ` ${this.watchlistOnly ? "WATCHLIST" : "MARKETS"} ${rangeStart}-${rangeEnd}/${markets.length}${moreStatus}${searchStatus} `;
+    this.footerText.content = this.searchActive
+      ? `SEARCH /${this.searchQuery}█   any term matches   Enter scan more   Esc clear   Ctrl-U erase`
+      : "↑/k ↓/j scroll + load   PgUp/PgDn page   / search   w watch   f filter   1/2/3 range   p pause   q quit";
     this.renderer.requestRender();
   }
 

@@ -180,7 +180,7 @@ export function TerminalDashboard() {
 
       <footer className="site-footer">
         <p>
-          Navigate with <kbd>↑</kbd> <kbd>↓</kbd> · <kbd>w</kbd> watch · <kbd>f</kbd> filter
+          Scroll + load with <kbd>↑</kbd> <kbd>↓</kbd> · <kbd>/</kbd> search · <kbd>w</kbd> watch
         </p>
         <p>Live provider rows · watchlist stored on this device</p>
       </footer>

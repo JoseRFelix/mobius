@@ -8,7 +8,9 @@ export type ProviderCallbacks = {
 
 export interface MarketProvider {
   readonly source: MarketSource;
+  readonly hasMore?: boolean;
   start(callbacks: ProviderCallbacks): Promise<void>;
+  loadMore?(): Promise<number>;
   stop(): void;
 }
 

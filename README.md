@@ -22,7 +22,11 @@ Browser watchlist: IndexedDB     Native watchlist: local SQLite
 
 The gateway maintains one provider connection and in-memory cache for all
 clients, broadcasts snapshots and deltas, reports provider health, and handles
-reconnects. Personal watchlists remain device-local.
+reconnects. It requests 50 active markets per provider initially, then follows
+each provider's cursor as the user scrolls. Adjust `MARKET_PAGE_SIZE` to change
+the incremental batch size. The TUI keeps a fixed pool of at most 40 rendered
+rows regardless of how many markets are cached. Personal watchlists remain
+device-local.
 
 ## Requirements
 
@@ -55,7 +59,11 @@ Its watchlist is stored in `.mobius/watchlist.sqlite` by default.
 
 ## Controls
 
-- `↑` / `k` and `↓` / `j`: select a provider market row
+- `↑` / `k` and `↓` / `j`: select a provider market row and load more near the end
+- `Page Up` / `Page Down`: move by one visible page
+- `Home` / `End`: jump to the first or last matching market
+- `/`: ranked search by question, provider, category, or market ID; any term can match
+- `Enter`: keep the search and scan additional provider pages; `Esc`: clear it
 - `w`: add or remove the selected market from the local watchlist
 - `f`: show all rows or watchlist rows only
 - `1`, `2`, `3`: switch between 1H, 24H, and 7D chart ranges
@@ -89,6 +97,5 @@ npx tsc --noEmit
 npm run lint
 ```
 
-The hosted browser shell still needs `NEXT_PUBLIC_TUI_BRIDGE_HOST` set to an
-always-on deployment of `tui/server.ts`; the Sites worker is not a persistent
-Bun WebSocket process.
+The hosted browser shell needs `NEXT_PUBLIC_TUI_BRIDGE_HOST` set to an
+always-on deployment of `tui/server.ts`.

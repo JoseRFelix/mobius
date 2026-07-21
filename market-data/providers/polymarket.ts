@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DEFAULT_MARKET_PAGE_SIZE, MAX_MARKET_PAGE_SIZE } from "../config";
 import { logger } from "../logger";
 import { providerStatus, type MarketProvider, type ProviderCallbacks } from "../provider";
 import {
@@ -141,14 +142,14 @@ function levels(value: unknown): OrderLevel[] {
 
 type PolymarketProviderOptions = {
   fetcher?: typeof fetch;
-  maxMarkets?: number;
+  pageSize?: number;
   refreshMs?: number;
 };
 
 export class PolymarketProvider implements MarketProvider {
   readonly source = "polymarket" as const;
   private readonly fetcher: typeof fetch;
-  private readonly maxMarkets: number;
+  private readonly pageSize: number;
   private readonly refreshMs: number;
   private callbacks?: ProviderCallbacks;
   private stopped = false;
@@ -157,12 +158,22 @@ export class PolymarketProvider implements MarketProvider {
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private socket?: WebSocket;
   private reconnectAttempts = 0;
+  private nextCursor?: string;
+  private paginationExhausted = false;
+  private pageLoadPromise?: Promise<number>;
   private readonly marketsByAsset = new Map<string, MarketRecord>();
 
   constructor(options: PolymarketProviderOptions = {}) {
     this.fetcher = options.fetcher ?? fetch;
-    this.maxMarkets = options.maxMarkets ?? 10;
+    this.pageSize = Math.min(
+      MAX_MARKET_PAGE_SIZE,
+      Math.max(1, Math.floor(options.pageSize ?? DEFAULT_MARKET_PAGE_SIZE)),
+    );
     this.refreshMs = options.refreshMs ?? 5 * 60_000;
+  }
+
+  get hasMore(): boolean {
+    return !this.paginationExhausted;
   }
 
   async start(callbacks: ProviderCallbacks): Promise<void> {
@@ -196,32 +207,62 @@ export class PolymarketProvider implements MarketProvider {
     this.callbacks = undefined;
   }
 
+  async loadMore(): Promise<number> {
+    if (this.pageLoadPromise) return this.pageLoadPromise;
+    if (this.paginationExhausted || !this.nextCursor) {
+      this.paginationExhausted = true;
+      return 0;
+    }
+
+    const cursor = this.nextCursor;
+    this.pageLoadPromise = this.fetchAndApplyPage(cursor, true);
+    try {
+      return await this.pageLoadPromise;
+    } catch (error) {
+      this.callbacks?.status(providerStatus(this.source, "stale", "Could not load next page"));
+      throw error;
+    } finally {
+      this.pageLoadPromise = undefined;
+    }
+  }
+
   private async refreshMarkets(): Promise<void> {
+    await this.fetchAndApplyPage(undefined, this.marketsByAsset.size === 0);
+  }
+
+  private async fetchAndApplyPage(
+    afterCursor: string | undefined,
+    advancePagination: boolean,
+  ): Promise<number> {
     const url = new URL("/markets/keyset", GAMMA_BASE_URL);
-    url.searchParams.set("limit", String(Math.max(this.maxMarkets * 2, 20)));
+    url.searchParams.set("limit", String(this.pageSize));
     url.searchParams.set("closed", "false");
     url.searchParams.set("order", "volume24hr");
     url.searchParams.set("ascending", "false");
+    if (afterCursor) url.searchParams.set("after_cursor", afterCursor);
 
     const response = await this.fetcher(url);
     if (!response.ok) throw new Error(`Polymarket discovery returned ${response.status}`);
     const payload = gammaResponseSchema.parse(await response.json());
+    if (advancePagination) {
+      this.nextCursor = payload.next_cursor;
+      this.paginationExhausted = !payload.next_cursor;
+    }
     const selected = payload.markets
       .filter((market) => market.acceptingOrders !== false)
       .map((market) => ({ market, normalized: normalizePolymarketMarket(market) }))
       .filter(
         (item): item is { market: GammaMarket; normalized: MarketRecord } =>
           item.normalized != null,
-      )
-      .slice(0, this.maxMarkets);
+      );
 
     const previousAssets = new Set(this.marketsByAsset.keys());
-    const nextAssets = new Set<string>();
-    const nextKeys = new Set<MarketRecord["key"]>();
+    let added = 0;
 
     for (const { normalized } of selected) {
       const assetId = normalized.outcomeId!;
       const existing = this.marketsByAsset.get(assetId);
+      if (!existing) added += 1;
       const market = existing
         ? {
             ...normalized,
@@ -232,24 +273,15 @@ export class PolymarketProvider implements MarketProvider {
           }
         : normalized;
       this.marketsByAsset.set(assetId, market);
-      nextAssets.add(assetId);
-      nextKeys.add(market.key);
       this.callbacks?.upsert(market);
     }
 
-    for (const assetId of previousAssets) {
-      if (nextAssets.has(assetId)) continue;
-      const removed = this.marketsByAsset.get(assetId);
-      if (removed) this.callbacks?.remove(removed.key);
-      this.marketsByAsset.delete(assetId);
-    }
-
-    this.updateSocketSubscriptions(previousAssets, nextAssets);
+    this.updateSocketSubscriptions(previousAssets, new Set(this.marketsByAsset.keys()));
     this.callbacks?.status(
       providerStatus(
         this.source,
         this.socket?.readyState === WebSocket.OPEN ? "live" : "polling",
-        `${nextKeys.size} markets`,
+        `${this.marketsByAsset.size} markets${this.hasMore ? " · more available" : ""}`,
       ),
     );
 
@@ -269,6 +301,8 @@ export class PolymarketProvider implements MarketProvider {
         this.callbacks?.upsert(next);
       }),
     );
+
+    return added;
   }
 
   private async fetchHistory(assetId: string): Promise<number[]> {
